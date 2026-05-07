@@ -7,6 +7,8 @@ from datetime import datetime
 import csv
 from io import StringIO
 from collections import defaultdict
+import urllib.request
+import json
 
 app = FastAPI()
 security = HTTPBasic()
@@ -23,6 +25,8 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute('CREATE TABLE IF NOT EXISTS attendance (id INTEGER PRIMARY KEY, employee_id TEXT, timestamp TEXT, action TEXT, lat REAL, lon REAL)')
     cursor.execute('CREATE TABLE IF NOT EXISTS leaves (id INTEGER PRIMARY KEY, employee_id TEXT, dates TEXT, reason TEXT, status TEXT)')
+    # NEW: Table to store device push tokens
+    cursor.execute('CREATE TABLE IF NOT EXISTS users (employee_id TEXT PRIMARY KEY, push_token TEXT)')
     conn.commit()
     conn.close()
 
@@ -34,12 +38,34 @@ class LeaveRequest(BaseModel):
     dates: str
     reason: str
 
+class DeviceToken(BaseModel):
+    employee_id: str
+    push_token: str
+
+# --- EXPO PUSH NOTIFICATION ENGINE ---
+def send_push_notification(token, title, body):
+    url = "https://exp.host/--/api/v2/push/send"
+    payload = {"to": token, "title": title, "body": body, "sound": "default"}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})
+    try:
+        urllib.request.urlopen(req)
+    except Exception as e:
+        print("Push failed:", e)
+
 # --- ENDPOINTS ---
+@app.post("/register-device")
+async def register_device(data: DeviceToken, x_api_key: str = Header(None)):
+    if x_api_key != "HR_INNOVATE_2026": raise HTTPException(status_code=401)
+    conn = sqlite3.connect('hr_database.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO users (employee_id, push_token) VALUES (?, ?)", (data.employee_id, data.push_token))
+    conn.commit()
+    conn.close()
+    return {"status": "Device registered"}
 
 @app.post("/auto-punch")
 async def auto_punch(data: dict, x_api_key: str = Header(None)):
-    if x_api_key != "HR_INNOVATE_2026": 
-        raise HTTPException(status_code=401)
+    if x_api_key != "HR_INNOVATE_2026": raise HTTPException(status_code=401)
     conn = sqlite3.connect('hr_database.db')
     cursor = conn.cursor()
     cursor.execute("INSERT INTO attendance (employee_id, timestamp, action, lat, lon) VALUES (?, ?, ?, ?, ?)",
@@ -50,8 +76,7 @@ async def auto_punch(data: dict, x_api_key: str = Header(None)):
 
 @app.post("/request-leave")
 async def request_leave(req: LeaveRequest, x_api_key: str = Header(None)):
-    if x_api_key != "HR_INNOVATE_2026": 
-        raise HTTPException(status_code=401, detail="Invalid API Key")
+    if x_api_key != "HR_INNOVATE_2026": raise HTTPException(status_code=401)
     conn = sqlite3.connect('hr_database.db')
     cursor = conn.cursor()
     cursor.execute("INSERT INTO leaves (employee_id, dates, reason, status) VALUES (?, ?, ?, ?)",
@@ -63,18 +88,29 @@ async def request_leave(req: LeaveRequest, x_api_key: str = Header(None)):
 @app.get("/policies")
 async def get_policies():
     return {
-        "policies": [
-            {"title": "HR Code of Conduct 2026"},
-            {"title": "Global Remote Work Policy"},
-            {"title": "Health & Benefits Package"}
-        ]
+        "policies": [{"title": "HR Code of Conduct 2026"}, {"title": "Global Remote Work Policy"}, {"title": "Health & Benefits Package"}]
     }
 
 @app.post("/approve-leave/{leave_id}")
 async def approve_leave(leave_id: int, admin: str = Depends(verify_admin)):
     conn = sqlite3.connect('hr_database.db')
     cursor = conn.cursor()
+    
+    # 1. Find who requested this leave
+    cursor.execute("SELECT employee_id FROM leaves WHERE id = ?", (leave_id,))
+    emp = cursor.fetchone()
+    
+    # 2. Update the status
     cursor.execute("UPDATE leaves SET status = 'Approved ✅' WHERE id = ?", (leave_id,))
+    
+    # 3. Fetch their token and send the push notification
+    if emp:
+        emp_id = emp[0]
+        cursor.execute("SELECT push_token FROM users WHERE employee_id = ?", (emp_id,))
+        token_row = cursor.fetchone()
+        if token_row and token_row[0]:
+            send_push_notification(token_row[0], "Leave Approved! 🎉", f"Your time off request has been authorized by HR.")
+            
     conn.commit()
     conn.close()
     return RedirectResponse(url="/logs", status_code=303)
@@ -93,27 +129,20 @@ async def export_payroll(admin: str = Depends(verify_admin)):
     for emp, action, ts_str in records:
         try:
             ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-            if action == 'ENTRY':
-                current_entry[emp] = ts
+            if action == 'ENTRY': current_entry[emp] = ts
             elif action == 'EXIT' and emp in current_entry:
                 duration = (ts - current_entry[emp]).total_seconds() / 3600.0 
                 hours_worked[emp] += duration
                 del current_entry[emp] 
-        except Exception:
-            continue
+        except Exception: continue
 
     output = StringIO()
     writer = csv.writer(output)
     writer.writerow(["Employee ID", "Total Hours Worked (Calculated)"])
-    for emp, hours in hours_worked.items():
-        writer.writerow([emp, round(hours, 2)])
+    for emp, hours in hours_worked.items(): writer.writerow([emp, round(hours, 2)])
     output.seek(0)
     
-    return StreamingResponse(
-        output, 
-        media_type="text/csv", 
-        headers={"Content-Disposition": "attachment; filename=Innovate_HR_Payroll.csv"}
-    )
+    return StreamingResponse(output, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=Innovate_HR_Payroll.csv"})
 
 # --- THE PRO DASHBOARD ---
 @app.get("/logs", response_class=HTMLResponse)
@@ -137,13 +166,10 @@ def view_logs(admin: str = Depends(verify_admin)):
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
         <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
         <style>
-            /* Custom Webkit Scrollbar */
             ::-webkit-scrollbar { width: 8px; }
             ::-webkit-scrollbar-track { background: #0f172a; }
             ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
             ::-webkit-scrollbar-thumb:hover { background: #06b6d4; }
-            
-            /* Glassmorphism & Effects */
             .glass-card { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.05); }
             .neon-glow { text-shadow: 0 0 20px rgba(6, 182, 212, 0.6); }
         </style>
@@ -151,7 +177,6 @@ def view_logs(admin: str = Depends(verify_admin)):
     <body class="bg-[#0b1120] text-slate-200 min-h-screen font-sans selection:bg-cyan-500/30 overflow-hidden">
         
         <div class="w-full h-screen px-4 py-4 md:px-8 md:py-6 flex flex-col">
-            
             <header class="flex justify-between items-center mb-6 glass-card px-8 py-5 rounded-3xl shadow-2xl shadow-cyan-900/10 flex-shrink-0">
                 <div class="flex items-center gap-5">
                     <div class="h-14 w-14 rounded-full bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center shadow-[0_0_20px_rgba(6,182,212,0.4)] animate-pulse">
@@ -176,11 +201,8 @@ def view_logs(admin: str = Depends(verify_admin)):
             </header>
 
             <div class="grid grid-cols-1 xl:grid-cols-4 gap-6 flex-grow min-h-0">
-                
                 <div class="xl:col-span-1 glass-card p-6 rounded-3xl flex flex-col h-full shadow-2xl">
-                    <h2 class="text-xl font-black mb-6 flex items-center gap-3 text-white border-b border-slate-700/50 pb-4">
-                        <span class="text-2xl">📅</span> Action Queue
-                    </h2>
+                    <h2 class="text-xl font-black mb-6 flex items-center gap-3 text-white border-b border-slate-700/50 pb-4"><span class="text-2xl">📅</span> Action Queue</h2>
                     <div class="space-y-4 overflow-y-auto pr-2 flex-grow">
     """
     
@@ -202,7 +224,6 @@ def view_logs(admin: str = Depends(verify_admin)):
                 </div>
 
                 <div class="xl:col-span-3 flex flex-col gap-6 h-full">
-                    
                     <div class="relative h-3/5 rounded-3xl overflow-hidden glass-card border border-slate-700/50 shadow-[0_0_40px_rgba(0,0,0,0.5)]">
                         <div class="absolute top-5 left-5 z-[400] bg-slate-900/90 backdrop-blur px-5 py-2 rounded-xl border border-slate-700 text-sm font-black text-cyan-400 shadow-lg flex items-center gap-2">
                             <div class="h-2 w-2 bg-cyan-400 rounded-full animate-pulse"></div> Live Tracking Active
@@ -249,18 +270,9 @@ def view_logs(admin: str = Depends(verify_admin)):
             var map = L.map('map', { zoomControl: false }).setView([43.7, -79.3], 3);
             L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-                attribution: '&copy; OpenStreetMap',
-                subdomains: 'abcd',
-                maxZoom: 20
-            }).addTo(map);
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { attribution: '&copy; OpenStreetMap', subdomains: 'abcd', maxZoom: 20 }).addTo(map);
 
-            var neonIcon = L.divIcon({
-                className: 'custom-div-icon',
-                html: '<div style="background-color: #06b6d4; width: 14px; height: 14px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 15px #06b6d4, 0 0 30px #06b6d4; animation: pulse 2s infinite;"></div>',
-                iconSize: [14, 14],
-                iconAnchor: [7, 7]
-            });
+            var neonIcon = L.divIcon({ className: 'custom-div-icon', html: '<div style="background-color: #06b6d4; width: 14px; height: 14px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 15px #06b6d4, 0 0 30px #06b6d4; animation: pulse 2s infinite;"></div>', iconSize: [14, 14], iconAnchor: [7, 7] });
     """
     
     for r in att:
