@@ -36,6 +36,36 @@ async def auto_punch(data: dict, x_api_key: str = Header(None)):
     conn.commit()
     conn.close()
     return {"status": "success"}
+# --- ADD THESE MISSING Pydantic Models & ENDPOINTS ---
+class LeaveRequest(BaseModel):
+    employee_id: str
+    dates: str
+    reason: str
+
+@app.post("/request-leave")
+async def request_leave(req: LeaveRequest, x_api_key: str = Header(None)):
+    if x_api_key != "HR_INNOVATE_2026": 
+        raise HTTPException(status_code=401, detail="Invalid API Key")
+    
+    conn = sqlite3.connect('hr_database.db')
+    cursor = conn.cursor()
+    # Insert the request with a 'Pending' status
+    cursor.execute("INSERT INTO leaves (employee_id, dates, reason, status) VALUES (?, ?, ?, ?)",
+                   (req.employee_id, req.dates, req.reason, 'Pending ⏳'))
+    conn.commit()
+    conn.close()
+    return {"msg": "Request received by Command Center"}
+
+@app.get("/policies")
+async def get_policies():
+    # This sends the digital documents to the app's Vault
+    return {
+        "policies": [
+            {"title": "HR Code of Conduct 2026"},
+            {"title": "Global Remote Work Policy"},
+            {"title": "Health & Benefits Package"}
+        ]
+    }
 
 @app.post("/approve-leave/{leave_id}")
 async def approve_leave(leave_id: int, admin: str = Depends(verify_admin)):
